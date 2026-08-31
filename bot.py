@@ -6,7 +6,10 @@
      (این صفحه بدون نیاز به لاگین یا API در دسترسه، پس هیچ VPN یا api_id لازم نیست)
   2. پست‌های جدید (بعد از آخرین پستی که دیدیم) رو استخراج می‌کنیم: متن + عکس‌ها + ویدیو
   3. اگه مرتبط با AI بود، متن رو به فارسی ترجمه می‌کنیم
-  4. با یک بات معمولی تلگرام (که از @BotFather گرفتیم) توی کانال خودمون پست می‌کنیم
+  4. عکس/ویدیو رو خودمون دانلود و مستقیم آپلود می‌کنیم (نه لینک‌دادن به تلگرام،
+     چون لینک‌های CDN تلگرام پشت محافظت آنتی‌هاتلینک هستن و تلگرام خودش
+     نمی‌تونه بگیرتشون)
+  5. با یک بات معمولی تلگرام (که از @BotFather گرفتیم) توی کانال خودمون پست می‌کنیم
 
 هیچ‌کدوم از مراحل بالا نیاز به my.telegram.org یا Telethon نداره.
 """
@@ -31,8 +34,7 @@ SOURCE_CHANNELS = [
     for c in os.environ["SOURCE_CHANNELS"].split(",")
     if c.strip()
 ]
-# حذف تکراری‌ها با حفظ ترتیب
-SOURCE_CHANNELS = list(dict.fromkeys(SOURCE_CHANNELS))
+SOURCE_CHANNELS = list(dict.fromkeys(SOURCE_CHANNELS))  # حذف تکراری
 
 TRANSLATE_API_KEY = os.environ["TRANSLATE_API_KEY"]
 TRANSLATE_BASE_URL = os.environ.get("TRANSLATE_BASE_URL", "https://api.deepseek.com/v1")
@@ -40,13 +42,28 @@ TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "deepseek-chat")
 
 FILTER_AI_ONLY = os.environ.get("FILTER_AI_ONLY", "True").lower() == "true"
 
+# در اولین اجرای هر کانال، چند تا از آخرین پست‌ها بک‌فیل بشن
+BACKFILL_ON_FIRST_RUN = int(os.environ.get("BACKFILL_ON_FIRST_RUN", "2"))
+
+# سقف کل پست‌هایی که در یک اجرا (روی همه‌ی کانال‌ها جمعاً) پردازش میشن،
+# تا اجرا هیچ‌وقت از زمان مجاز GitHub Actions رد نشه
+MAX_POSTS_PER_RUN = int(os.environ.get("MAX_POSTS_PER_RUN", "12"))
+
+# محدودیت‌های تلگرام برای طول متن
+MAX_CAPTION_LEN = 1024   # کپشن عکس/ویدیو
+MAX_MESSAGE_LEN = 4096   # پیام متنی خالی
+
 STATE_PATH = "state.json"
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ai_news_bot")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://t.me/",
+}
+
 
 # ---------------------------------------------------------------------------
 # وضعیت (state) بین اجراها
@@ -83,6 +100,12 @@ def is_ai_related(text: str) -> bool:
     return any(kw in lowered for kw in AI_KEYWORDS)
 
 
+def truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
 # ---------------------------------------------------------------------------
 # ترجمه
 # ---------------------------------------------------------------------------
@@ -107,11 +130,11 @@ def translate_to_persian(text: str) -> str:
                             "اصطلاحات تخصصی هوش مصنوعی رو به شکل رایج و قابل‌فهم فارسی بنویس."
                         ),
                     },
-                    {"role": "user", "content": text},
+                    {"role": "user", "content": text[:3000]},
                 ],
                 "temperature": 0.3,
             },
-            timeout=30,
+            timeout=15,
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
@@ -125,13 +148,13 @@ def translate_to_persian(text: str) -> str:
 # ---------------------------------------------------------------------------
 def fetch_channel_posts(channel: str):
     url = f"https://t.me/s/{channel}"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
     posts = []
     for msg_div in soup.select("div.tgme_widget_message"):
-        data_post = msg_div.get("data-post")  # فرمت: "channel/123"
+        data_post = msg_div.get("data-post")
         if not data_post:
             continue
         try:
@@ -155,20 +178,27 @@ def fetch_channel_posts(channel: str):
             video_url = video_tag["src"]
 
         posts.append(
-            {
-                "id": msg_id,
-                "text": text,
-                "photo_urls": photo_urls,
-                "video_url": video_url,
-            }
+            {"id": msg_id, "text": text, "photo_urls": photo_urls, "video_url": video_url}
         )
 
-    posts.sort(key=lambda p: p["id"])  # قدیمی‌ترین اول
+    posts.sort(key=lambda p: p["id"])
     return posts
 
 
 # ---------------------------------------------------------------------------
-# پست کردن در کانال مقصد با Bot API
+# دانلود مدیا (چون تلگرام خودش نمی‌تونه لینک‌های محافظت‌شده رو fetch کنه)
+# ---------------------------------------------------------------------------
+def download_media(url: str, max_bytes: int = 20 * 1024 * 1024):
+    r = requests.get(url, headers=HEADERS, timeout=20, stream=True)
+    r.raise_for_status()
+    content = r.content
+    if len(content) > max_bytes:
+        raise ValueError("فایل خیلی بزرگه")
+    return content
+
+
+# ---------------------------------------------------------------------------
+# پست کردن در کانال مقصد با Bot API (آپلود مستقیم فایل، نه لینک)
 # ---------------------------------------------------------------------------
 def send_to_channel(post: dict, caption: str):
     photo_urls = post["photo_urls"]
@@ -176,30 +206,35 @@ def send_to_channel(post: dict, caption: str):
 
     try:
         if len(photo_urls) > 1:
-            media = [{"type": "photo", "media": u} for u in photo_urls]
-            media[0]["caption"] = caption
-            media[0]["parse_mode"] = "HTML"
-            r = requests.post(
-                f"{BOT_API}/sendMediaGroup",
-                json={"chat_id": TARGET_CHANNEL, "media": media},
-                timeout=30,
-            )
+            media = []
+            files = {}
+            for i, u in enumerate(photo_urls[:10]):  # سقف تلگرام برای آلبوم: ۱۰ تا
+                content = download_media(u)
+                field = f"photo{i}"
+                files[field] = (f"{field}.jpg", content, "image/jpeg")
+                item = {"type": "photo", "media": f"attach://{field}"}
+                if i == 0 and caption.strip():
+                    item["caption"] = truncate(caption, MAX_CAPTION_LEN)
+                media.append(item)
+            data = {"chat_id": TARGET_CHANNEL, "media": json.dumps(media)}
+            r = requests.post(f"{BOT_API}/sendMediaGroup", data=data, files=files, timeout=60)
+
         elif len(photo_urls) == 1:
-            r = requests.post(
-                f"{BOT_API}/sendPhoto",
-                json={"chat_id": TARGET_CHANNEL, "photo": photo_urls[0], "caption": caption},
-                timeout=30,
-            )
+            content = download_media(photo_urls[0])
+            files = {"photo": ("photo.jpg", content, "image/jpeg")}
+            data = {"chat_id": TARGET_CHANNEL, "caption": truncate(caption, MAX_CAPTION_LEN)}
+            r = requests.post(f"{BOT_API}/sendPhoto", data=data, files=files, timeout=60)
+
         elif video_url:
-            r = requests.post(
-                f"{BOT_API}/sendVideo",
-                json={"chat_id": TARGET_CHANNEL, "video": video_url, "caption": caption},
-                timeout=30,
-            )
+            content = download_media(video_url)
+            files = {"video": ("video.mp4", content, "video/mp4")}
+            data = {"chat_id": TARGET_CHANNEL, "caption": truncate(caption, MAX_CAPTION_LEN)}
+            r = requests.post(f"{BOT_API}/sendVideo", data=data, files=files, timeout=60)
+
         elif caption.strip():
             r = requests.post(
                 f"{BOT_API}/sendMessage",
-                json={"chat_id": TARGET_CHANNEL, "text": caption},
+                json={"chat_id": TARGET_CHANNEL, "text": truncate(caption, MAX_MESSAGE_LEN)},
                 timeout=30,
             )
         else:
@@ -209,8 +244,22 @@ def send_to_channel(post: dict, caption: str):
         if not ok:
             log.error(f"تلگرام خطا داد: {r.text}")
         return ok
+
     except Exception as e:
-        log.error(f"خطا در ارسال به کانال: {e}")
+        log.error(f"خطا در ارسال به کانال، تلاش با متن‌تنها: {e}")
+        if caption.strip():
+            try:
+                r = requests.post(
+                    f"{BOT_API}/sendMessage",
+                    json={
+                        "chat_id": TARGET_CHANNEL,
+                        "text": truncate(caption, MAX_MESSAGE_LEN),
+                    },
+                    timeout=30,
+                )
+                return r.json().get("ok", False)
+            except Exception as e2:
+                log.error(f"خطا در ارسال متن جایگزین: {e2}")
         return False
 
 
@@ -219,21 +268,32 @@ def send_to_channel(post: dict, caption: str):
 # ---------------------------------------------------------------------------
 def main():
     state = load_state()
+    processed_count = 0
 
     for channel in SOURCE_CHANNELS:
+        if processed_count >= MAX_POSTS_PER_RUN:
+            break
+
         try:
             posts = fetch_channel_posts(channel)
         except Exception as e:
             log.error(f"خطا در خوندن کانال {channel}: {e}")
             continue
 
+        is_first_run_for_channel = channel not in state["last_ids"]
         last_id = state["last_ids"].get(channel, 0)
         new_last_id = last_id
 
-        for post in posts:
-            if post["id"] <= last_id:
-                continue
+        candidates = [p for p in posts if p["id"] > last_id]
+        if is_first_run_for_channel:
+            candidates = candidates[-BACKFILL_ON_FIRST_RUN:] if BACKFILL_ON_FIRST_RUN > 0 else []
+
+        for post in candidates:
+            if processed_count >= MAX_POSTS_PER_RUN:
+                break  # بقیه پست‌های این کانال برای اجرای بعدی می‌مونن
+
             new_last_id = max(new_last_id, post["id"])
+            processed_count += 1
 
             if not is_ai_related(post["text"]):
                 continue
@@ -242,12 +302,12 @@ def main():
             ok = send_to_channel(post, translated)
             if ok:
                 log.info(f"پست شد: {channel}/{post['id']}")
-            time.sleep(1)  # جلوگیری از rate limit تلگرام
+            time.sleep(1)
 
         state["last_ids"][channel] = new_last_id
 
     save_state(state)
-    log.info("اجرای این دور تمام شد.")
+    log.info(f"اجرای این دور تمام شد. ({processed_count} پست بررسی شد)")
 
 
 if __name__ == "__main__":
