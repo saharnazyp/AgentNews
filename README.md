@@ -1,27 +1,31 @@
-# ربات تجمیع اخبار هوش مصنوعی (نسخه ساده - بدون my.telegram.org)
+# AI News Aggregation Bot
+------------------
+This version does **not** require `my.telegram.org`, `api_id`, `api_hash`, or a Session String.
 
-این نسخه هیچ نیازی به my.telegram.org، api_id، api_hash، یا Session String نداره.
-فقط با یک **بات معمولی تلگرام** (که در عرض ۱ دقیقه از داخل خود اپ تلگرام می‌سازی) کار می‌کنه.
+It works entirely with a **regular Telegram bot** (which you can create from within the Telegram app in about 1 minute).
 
-## چرا این نسخه بهتره؟
+## Why is this version better?
 
-- **خوندن کانال‌های منبع**: از نسخه‌ی وب عمومی هر کانال (`https://t.me/s/channel_name`) استفاده می‌کنیم که بدون لاگین در دسترسه. نیازی به عضویت، ادمین بودن، یا API نیست.
-- **پست کردن**: چون توی کانال خودت ادمینی، یک بات معمولی (نه userbot) کافیه.
-- **اجرا روی GitHub Actions**: چون اسکریپت روی سرورهای گیت‌هاب اجرا میشه (نه سیستم خودت)، فیلترینگ ایران و مشکل my.telegram.org اصلاً اینجا مطرح نیست.
+* **Reading source channels:** We use the public web version of each channel (`https://t.me/s/channel_name`), which is accessible without logging in. There is no need to be a member of the channel, an admin, or use any Telegram API.
+* **Posting:** Since you are an admin of your own channel, a regular bot (not a userbot) is enough.
+* **Running on GitHub Actions:** The script runs on GitHub's servers, not on your own computer. Therefore, Iran's filtering restrictions and `my.telegram.org` access issues are not relevant here.
 
-## مرحله ۱: ساخت بات (۲ دقیقه، داخل خود تلگرام)
+## Step 1: Create the Bot (2 minutes, inside Telegram)
 
-1. توی تلگرام دنبال `@BotFather` بگرد و باهاش چت کن
-2. بفرست: `/newbot`
-3. یک اسم و یوزرنیم (باید به `bot` ختم بشه، مثلا `ai_news_agg_bot`) بهش بده
-4. یک توکن می‌ده شبیه `123456789:AAExampleTokenHere` — همینو نگه دار (این `BOT_TOKEN` توئه)
+1. Search for `@BotFather` on Telegram and start a chat.
+2. Send: `/newbot`
+3. Choose a name and username for your bot. The username must end with `bot`, for example: `ai_news_agg_bot`.
+4. BotFather will give you a token similar to:
+   `123456789:AAExampleTokenHere`
 
-## مرحله ۲: اضافه کردن بات به کانال خودت
+   Keep this token safe. This is your `BOT_TOKEN`.
 
-1. بات رو به کانالی که می‌خوای اخبار توش پست بشه اضافه کن
-2. نقشش رو **ادمین** کن (حداقل با دسترسی "post messages")
+## Step 2: Add the Bot to Your Channel
 
-## مرحله ۳: ساخت ریپازیتوری و پوش کردن فایل‌ها
+1. Add the bot to the channel where you want the news to be posted.
+2. Make the bot an **Administrator** with at least the **"Post Messages"** permission.
+
+## Step 3: Create a Repository and Push the Files
 
 ```bash
 git init
@@ -31,29 +35,42 @@ git branch -M main
 git remote add origin https://github.com/USERNAME/REPO.git
 git push -u origin main
 ```
-(ریپو رو ترجیحاً **Private** بساز.)
 
-## مرحله ۴: ثبت Secrets
+It is recommended to make the repository **Private**.
 
-توی ریپو: **Settings → Secrets and variables → Actions → New repository secret**
+## Step 4: Add Repository Secrets
 
-| نام Secret | مقدار |
-|---|---|
-| `BOT_TOKEN` | توکنی که از BotFather گرفتی |
-| `TARGET_CHANNEL` | یوزرنیم کانال خودت، مثلا `@my_output_channel` |
-| `SOURCE_CHANNELS` | یوزرنیم کانال‌های منبع با کاما جدا (بدون `https://t.me/`), مثلا: `Artificial_intelligence_in,bestaitoolsai,hiaimediaen,perplexity,ai_news_world,ai_fans` |
-| `TRANSLATE_API_KEY` | کلید سرویس ترجمه |
-| `TRANSLATE_BASE_URL` | مثلا `https://api.deepseek.com/v1` |
-| `TRANSLATE_MODEL` | مثلا `deepseek-chat` |
+In your repository, go to:
 
-## مرحله ۵: فعال‌سازی و تست
+**Settings → Secrets and variables → Actions → New repository secret**
 
-مطمئن شو تب **Actions** ریپو فعاله (برای ریپوی خصوصی: Settings → Actions → General). بعد از پوش شدن، workflow خودش طبق زمان‌بندی (هر ۱۰ دقیقه) اجرا میشه. برای تست فوری: **Actions → AI News Poll → Run workflow**.
+| Secret Name          | Value                                                                                                                                                                   |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BOT_TOKEN`          | The token you received from BotFather                                                                                                                                   |
+| `TARGET_CHANNEL`     | Your channel username, for example `@my_output_channel`                                                                                                                 |
+| `SOURCE_CHANNELS`    | Source channel usernames separated by commas, without `https://t.me/`. Example: `Artificial_intelligence_in,bestaitoolsai,hiaimediaen,perplexity,ai_news_world,ai_fans` |
+| `TRANSLATE_API_KEY`  | Your translation service API key                                                                                                                                        |
+| `TRANSLATE_BASE_URL` | For example: `https://api.deepseek.com/v1`                                                                                                                              |
+| `TRANSLATE_MODEL`    | For example: `deepseek-chat`                                                                                                                                            |
 
-## نکات مهم
+## Step 5: Enable and Test
 
-- **اجرای اول**: چون `state.json` خالیه، در اولین اجرا آخرین حدود ۲۰ پست هر کانال (هر چیزی که در صفحه‌ی وب کانال باشه) بررسی و پست میشه. اجراهای بعدی فقط پست‌های واقعاً جدید رو می‌گیرن.
-- **محدودیت نسخه‌ی وب کانال**: صفحه‌ی `t.me/s/` معمولاً فقط ~۲۰ پست آخر رو نشون میده، نه کل تاریخچه — برای اخبار روزانه کافیه.
-- **آلبوم چند عکسی**: این نسخه چند عکس یک پست رو هم تشخیص میده و با هم (به‌صورت گروهی) پست می‌کنه.
-- **کانال باید عمومی باشه**: هر ۶ کانالی که فرستادی عمومی‌ان، پس مشکلی نیست. اگه بعداً کانال خصوصی اضافه کردی، این روش کار نمی‌کنه (چون صفحه‌ی وب فقط برای کانال عمومی وجود داره).
-- می‌تونی مقدار `cron` رو در `.github/workflows/poll.yml` عوض کنی (مثلا هر ۵ یا ۱۵ دقیقه).
+Make sure the **Actions** tab is enabled for the repository.
+
+For a private repository, go to:
+
+**Settings → Actions → General**
+
+After you push the files, the workflow will automatically run according to its schedule (every 10 minutes).
+
+For an immediate test, go to:
+
+**Actions → AI News Poll → Run workflow**
+
+## Important Notes
+
+* **First run:** Since `state.json` is empty, the first execution will check and publish the latest approximately 20 posts from each channel (whatever is available on the channel's web page). On subsequent runs, only genuinely new posts will be processed.
+* **Web version limitation:** The `t.me/s/` web page usually displays only the latest ~20 posts rather than the entire channel history. This is sufficient for daily news aggregation.
+* **Multiple-photo albums:** This version can detect multiple photos belonging to the same post and publish them together as a group.
+* **Channels must be public:** All six channels you provided are public, so there should be no issue. If you add a private channel later, this method will not work because the web version is only available for public channels.
+* **Changing the schedule:** You can modify the `cron` value in `.github/workflows/poll.yml` to change the frequency, for example, every 5 or 15 minutes.
