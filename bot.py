@@ -79,11 +79,18 @@ HEADERS = {
 def load_state():
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"last_ids": {}}
+            data = json.load(f)
+    else:
+        data = {}
+    data.setdefault("seen_ids", {})       # channel -> [post_id, ...] که واقعاً پست شدن یا آگاهانه رد شدن
+    data.setdefault("last_ids", {})       # فقط برای مهاجرت از نسخه‌ی قبلی نگه داشته میشه
+    return data
 
 
 def save_state(state):
+    # هر کانال حداکثر ۳۰۰ آیدی آخر رو نگه می‌داره که فایل بی‌نهایت بزرگ نشه
+    for ch, ids in state["seen_ids"].items():
+        state["seen_ids"][ch] = sorted(set(ids), reverse=True)[:300]
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -308,12 +315,17 @@ def main():
             summary.append(f"{channel}: خطا در خوندن ({e})")
             continue
 
-        is_first_run_for_channel = channel not in state["last_ids"]
-        last_id = state["last_ids"].get(channel, 0)
-        new_last_id = last_id
+        seen_ids = set(state["seen_ids"].get(channel, []))
+        is_brand_new_channel = channel not in state["seen_ids"] and channel not in state["last_ids"]
 
-        candidates = [p for p in posts if p["id"] > last_id]
-        if is_first_run_for_channel:
+        # مهاجرت از نسخه‌ی قبلی: هر چی قبلاً با last_id رد شده بود رو seen حساب کن
+        # که دوباره پست نشه
+        old_last_id = state["last_ids"].get(channel)
+        if old_last_id is not None:
+            seen_ids |= {p["id"] for p in posts if p["id"] <= old_last_id}
+
+        candidates = [p for p in posts if p["id"] not in seen_ids]
+        if is_brand_new_channel:
             candidates = candidates[-BACKFILL_ON_FIRST_RUN:] if BACKFILL_ON_FIRST_RUN > 0 else []
 
         # سهمیه‌ی این کانال در همین اجرا - بقیه‌ی پست‌های احتمالی برای اجرای بعدی می‌مونن
@@ -321,25 +333,37 @@ def main():
         remaining = len(candidates) - len(to_process)
 
         posted_count = 0
+        failed_count = 0
         for post in to_process:
-            new_last_id = max(new_last_id, post["id"])
             total_processed += 1
 
             if not is_ai_related(post["text"]):
+                seen_ids.add(post["id"])  # آگاهانه رد شد، دیگه لازم نیست دوباره چکش کنیم
                 continue
 
             translated = translate_to_persian(post["text"])
             ok = send_to_channel(post, translated)
             if ok:
                 posted_count += 1
+                seen_ids.add(post["id"])
                 log.info(f"پست شد: {channel}/{post['id']}")
+            else:
+                # عمداً به seen_ids اضافه نمیشه تا دور بعد دوباره امتحان بشه
+                failed_count += 1
+                log.warning(f"پست نشد، دور بعد دوباره تلاش میشه: {channel}/{post['id']}")
             time.sleep(0.5)
 
-        state["last_ids"][channel] = new_last_id
+        state["seen_ids"][channel] = list(seen_ids)
         note = f"{channel}: {posted_count} پست منتشر شد"
+        if failed_count:
+            note += f"، {failed_count} تا شکست خورد (دوباره تلاش میشه)"
         if remaining > 0:
             note += f" ({remaining} پست دیگه برای اجرای بعدی مونده)"
         summary.append(note)
+
+    # last_ids دیگه استفاده نمیشه، فقط برای سازگاری با نسخه‌ی قبلی نگه داشته شد؛
+    # از این به بعد پاکش می‌کنیم که فایل state تمیز بمونه
+    state["last_ids"] = {}
 
     save_state(state)
     log.info("خلاصه‌ی این اجرا:")
