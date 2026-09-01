@@ -42,16 +42,24 @@ TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "deepseek-chat")
 
 FILTER_AI_ONLY = os.environ.get("FILTER_AI_ONLY", "True").lower() == "true"
 
-# در اولین اجرای هر کانال، چند تا از آخرین پست‌ها بک‌فیل بشن
-BACKFILL_ON_FIRST_RUN = int(os.environ.get("BACKFILL_ON_FIRST_RUN", "2"))
+# در اولین اجرای هر کانال، چند تا از آخرین پست‌ها بک‌فیل بشن.
+# نسخه‌ی وب کانال (t.me/s) خودش حداکثر ~۲۰ پست آخر رو نشون میده، پس عدد ۲۰
+# یعنی «هر چی هست بیار» (سقف واقعی رو خود صفحه‌ی تلگرام تعیین می‌کنه، نه ما).
+BACKFILL_ON_FIRST_RUN = int(os.environ.get("BACKFILL_ON_FIRST_RUN", "20"))
 
-# سقف کل پست‌هایی که در یک اجرا (روی همه‌ی کانال‌ها جمعاً) پردازش میشن،
-# تا اجرا هیچ‌وقت از زمان مجاز GitHub Actions رد نشه
-MAX_POSTS_PER_RUN = int(os.environ.get("MAX_POSTS_PER_RUN", "12"))
+# حداکثر چند پست جدید از هر کانال در هر اجرا پردازش بشه (تا کانال‌های پرکار
+# سهمیه‌ی کانال‌های دیگه رو نخورن). عدد بالا یعنی عملاً محدودیتی نیست.
+MAX_POSTS_PER_CHANNEL = int(os.environ.get("MAX_POSTS_PER_CHANNEL", "20"))
 
 # محدودیت‌های تلگرام برای طول متن
 MAX_CAPTION_LEN = 1024   # کپشن عکس/ویدیو
 MAX_MESSAGE_LEN = 4096   # پیام متنی خالی
+
+# امضای ثابتی که زیر هر پست اضافه میشه (از Secrets قابل تغییره، وگرنه این پیش‌فرضه)
+SIGNATURE = os.environ.get(
+    "SIGNATURE",
+    "AI mind | saharnaz\nInstagram: saharnaz.astronomy\nTelegram & Bale: @saharnazAILearning",
+)
 
 STATE_PATH = "state.json"
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -106,6 +114,15 @@ def truncate(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def with_signature(text: str, limit: int) -> str:
+    """متن رو کوتاه می‌کنه (در صورت لزوم) تا امضا زیرش جا بشه، بعد امضا رو اضافه می‌کنه."""
+    footer = f"\n\n{SIGNATURE}" if SIGNATURE.strip() else ""
+    body_limit = max(limit - len(footer), 0)
+    body = truncate(text, body_limit) if text.strip() else text
+    combined = f"{body}{footer}" if body.strip() else SIGNATURE
+    return combined[:limit]
+
+
 # ---------------------------------------------------------------------------
 # ترجمه
 # ---------------------------------------------------------------------------
@@ -125,14 +142,26 @@ def translate_to_persian(text: str) -> str:
                     {
                         "role": "system",
                         "content": (
-                            "متن ورودی رو به فارسیِ روان، طبیعی و خبری ترجمه کن. "
-                            "فقط متن ترجمه‌شده رو برگردون، بدون هیچ توضیح یا مقدمه اضافه. "
-                            "اصطلاحات تخصصی هوش مصنوعی رو به شکل رایج و قابل‌فهم فارسی بنویس."
+                            "تو یک مترجم و ویراستار خبری حرفه‌ای هستی که برای یک کانال خبری "
+                            "هوش مصنوعی در تلگرام کار می‌کنی. متن انگلیسی زیر رو به فارسیِ "
+                            "کاملاً روان، طبیعی و روزنامه‌نگارانه بازنویسی کن — نه ترجمه‌ی "
+                            "کلمه‌به‌کلمه. یعنی:\n"
+                            "- ساختار جمله رو کاملاً بر اساس دستور زبان فارسی بازچینی کن، "
+                            "همون ترتیب کلمات جمله‌ی انگلیسی رو حفظ نکن.\n"
+                            "- جمله‌های خیلی بلند رو در صورت نیاز به چند جمله‌ی کوتاه‌تر و "
+                            "روان‌تر فارسی تبدیل کن.\n"
+                            "- اسم شرکت‌ها، محصولات، و اصطلاحات رایج تخصصی (مثل ChatGPT، "
+                            "OpenAI، مدل زبانی، API، LLM) رو به همون شکلی که در فارسی رایج و "
+                            "قابل‌فهمه بنویس؛ لازم نیست همه‌چیز رو فارسی‌سازی کنی.\n"
+                            "- اعداد، تاریخ‌ها و اسم‌های خاص رو دقیق و بدون تغییر منتقل کن.\n"
+                            "- لحن خبری، مستقیم، و بدون اضافه‌گویی یا نظر شخصی باشه.\n"
+                            "- هیچ توضیح، مقدمه، یا علامت نقل‌قول اضافه نکن؛ فقط و فقط متن "
+                            "نهایی فارسی رو برگردون."
                         ),
                     },
                     {"role": "user", "content": text[:3000]},
                 ],
-                "temperature": 0.3,
+                "temperature": 0.4,
             },
             timeout=15,
         )
@@ -213,8 +242,8 @@ def send_to_channel(post: dict, caption: str):
                 field = f"photo{i}"
                 files[field] = (f"{field}.jpg", content, "image/jpeg")
                 item = {"type": "photo", "media": f"attach://{field}"}
-                if i == 0 and caption.strip():
-                    item["caption"] = truncate(caption, MAX_CAPTION_LEN)
+                if i == 0:
+                    item["caption"] = with_signature(caption, MAX_CAPTION_LEN)
                 media.append(item)
             data = {"chat_id": TARGET_CHANNEL, "media": json.dumps(media)}
             r = requests.post(f"{BOT_API}/sendMediaGroup", data=data, files=files, timeout=60)
@@ -222,19 +251,19 @@ def send_to_channel(post: dict, caption: str):
         elif len(photo_urls) == 1:
             content = download_media(photo_urls[0])
             files = {"photo": ("photo.jpg", content, "image/jpeg")}
-            data = {"chat_id": TARGET_CHANNEL, "caption": truncate(caption, MAX_CAPTION_LEN)}
+            data = {"chat_id": TARGET_CHANNEL, "caption": with_signature(caption, MAX_CAPTION_LEN)}
             r = requests.post(f"{BOT_API}/sendPhoto", data=data, files=files, timeout=60)
 
         elif video_url:
             content = download_media(video_url)
             files = {"video": ("video.mp4", content, "video/mp4")}
-            data = {"chat_id": TARGET_CHANNEL, "caption": truncate(caption, MAX_CAPTION_LEN)}
+            data = {"chat_id": TARGET_CHANNEL, "caption": with_signature(caption, MAX_CAPTION_LEN)}
             r = requests.post(f"{BOT_API}/sendVideo", data=data, files=files, timeout=60)
 
         elif caption.strip():
             r = requests.post(
                 f"{BOT_API}/sendMessage",
-                json={"chat_id": TARGET_CHANNEL, "text": truncate(caption, MAX_MESSAGE_LEN)},
+                json={"chat_id": TARGET_CHANNEL, "text": with_signature(caption, MAX_MESSAGE_LEN)},
                 timeout=30,
             )
         else:
@@ -253,7 +282,7 @@ def send_to_channel(post: dict, caption: str):
                     f"{BOT_API}/sendMessage",
                     json={
                         "chat_id": TARGET_CHANNEL,
-                        "text": truncate(caption, MAX_MESSAGE_LEN),
+                        "text": with_signature(caption, MAX_MESSAGE_LEN),
                     },
                     timeout=30,
                 )
@@ -268,16 +297,15 @@ def send_to_channel(post: dict, caption: str):
 # ---------------------------------------------------------------------------
 def main():
     state = load_state()
-    processed_count = 0
+    total_processed = 0
+    summary = []
 
     for channel in SOURCE_CHANNELS:
-        if processed_count >= MAX_POSTS_PER_RUN:
-            break
-
         try:
             posts = fetch_channel_posts(channel)
         except Exception as e:
             log.error(f"خطا در خوندن کانال {channel}: {e}")
+            summary.append(f"{channel}: خطا در خوندن ({e})")
             continue
 
         is_first_run_for_channel = channel not in state["last_ids"]
@@ -288,12 +316,14 @@ def main():
         if is_first_run_for_channel:
             candidates = candidates[-BACKFILL_ON_FIRST_RUN:] if BACKFILL_ON_FIRST_RUN > 0 else []
 
-        for post in candidates:
-            if processed_count >= MAX_POSTS_PER_RUN:
-                break  # بقیه پست‌های این کانال برای اجرای بعدی می‌مونن
+        # سهمیه‌ی این کانال در همین اجرا - بقیه‌ی پست‌های احتمالی برای اجرای بعدی می‌مونن
+        to_process = candidates[:MAX_POSTS_PER_CHANNEL]
+        remaining = len(candidates) - len(to_process)
 
+        posted_count = 0
+        for post in to_process:
             new_last_id = max(new_last_id, post["id"])
-            processed_count += 1
+            total_processed += 1
 
             if not is_ai_related(post["text"]):
                 continue
@@ -301,13 +331,21 @@ def main():
             translated = translate_to_persian(post["text"])
             ok = send_to_channel(post, translated)
             if ok:
+                posted_count += 1
                 log.info(f"پست شد: {channel}/{post['id']}")
-            time.sleep(1)
+            time.sleep(0.5)
 
         state["last_ids"][channel] = new_last_id
+        note = f"{channel}: {posted_count} پست منتشر شد"
+        if remaining > 0:
+            note += f" ({remaining} پست دیگه برای اجرای بعدی مونده)"
+        summary.append(note)
 
     save_state(state)
-    log.info(f"اجرای این دور تمام شد. ({processed_count} پست بررسی شد)")
+    log.info("خلاصه‌ی این اجرا:")
+    for line in summary:
+        log.info(f"  - {line}")
+    log.info(f"اجرای این دور تمام شد. (مجموعاً {total_processed} پست بررسی شد)")
 
 
 if __name__ == "__main__":
