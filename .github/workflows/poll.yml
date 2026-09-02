@@ -30,6 +30,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
           SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
+          RSS_FEEDS: ${{ secrets.RSS_FEEDS }}
           TRANSLATE_API_KEY: ${{ secrets.TRANSLATE_API_KEY }}
           TRANSLATE_BASE_URL: ${{ secrets.TRANSLATE_BASE_URL }}
           TRANSLATE_MODEL: ${{ secrets.TRANSLATE_MODEL }}
