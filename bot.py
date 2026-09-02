@@ -58,7 +58,9 @@ MAX_MESSAGE_LEN = 4096   # پیام متنی خالی
 # امضای ثابتی که زیر هر پست اضافه میشه (از Secrets قابل تغییره، وگرنه این پیش‌فرضه)
 SIGNATURE = os.environ.get(
     "SIGNATURE",
-    "AI mind | saharnaz\nInstagram: saharnaz.astronomy\nTelegram & Bale: @saharnazAILearning",
+    "AI mind | saharnaz
+Instagram: saharnaz.astronomy
+Telegram & Bale: @saharnazAILearning",
 )
 
 STATE_PATH = "state.json"
