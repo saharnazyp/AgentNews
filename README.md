@@ -51,7 +51,7 @@ In your repository, go to:
 | `SOURCE_CHANNELS`    | Source channel usernames separated by commas, without `https://t.me/`. Example: `Artificial_intelligence_in,bestaitoolsai,hiaimediaen,perplexity,ai_news_world,ai_fans` |
 | `TRANSLATE_API_KEY`  | Your translation service API key                                                                                                                                        |
 | `TRANSLATE_BASE_URL` | For example: `https://api.deepseek.com/v1`                                                                                                                              |
-| `TRANSLATE_MODEL`    | For example: `deepseek-chat`                                                                                                                                            |
+| `TRANSLATE_MODEL`    | For example: `openai-o4mini`                                                                                                                                            |
 
 ## Step 5: Enable and Test
 
