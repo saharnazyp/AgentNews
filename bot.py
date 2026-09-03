@@ -1,48 +1,428 @@
-name: AI News Poll
+import hashlib
+import json
+import logging
+import os
+import re
+import time
 
-on:
-  schedule:
-    - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+import feedparser
+import requests
+from bs4 import BeautifulSoup
 
-concurrency:
-  group: ai-news-poll
-  cancel-in-progress: false
+# ---------------------------------------------------------------------------
+# تنظیمات
+# ---------------------------------------------------------------------------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]  # مثلا @my_output_channel
 
-jobs:
-  poll:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+SOURCE_CHANNELS = [
+    c.strip().rstrip("/").split("/")[-1]  # هم یوزرنیم خام و هم لینک کامل رو قبول می‌کنه
+    for c in os.environ["SOURCE_CHANNELS"].split(",")
+    if c.strip()
+]
+SOURCE_CHANNELS = list(dict.fromkeys(SOURCE_CHANNELS))  # حذف تکراری
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# آدرس فید RSS سایت‌های خبری (اختیاری) - با کاما جدا، مثلا فید تک‌کرانچ یا ورج
+RSS_FEEDS = [f.strip() for f in os.environ.get("RSS_FEEDS", "").split(",") if f.strip()]
+RSS_FEEDS = list(dict.fromkeys(RSS_FEEDS))
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+TRANSLATE_API_KEY = os.environ["TRANSLATE_API_KEY"]
+TRANSLATE_BASE_URL = os.environ.get("TRANSLATE_BASE_URL", "https://api.deepseek.com/v1")
+TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "deepseek-chat")
 
-      - name: Run bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
-          SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
-          RSS_FEEDS: ${{ secrets.RSS_FEEDS }}
-          TRANSLATE_API_KEY: ${{ secrets.TRANSLATE_API_KEY }}
-          TRANSLATE_BASE_URL: ${{ secrets.TRANSLATE_BASE_URL }}
-          TRANSLATE_MODEL: ${{ secrets.TRANSLATE_MODEL }}
-          SIGNATURE: ${{ secrets.SIGNATURE }}
-          FILTER_AI_ONLY: "True"
-        run: python bot.py
+FILTER_AI_ONLY = os.environ.get("FILTER_AI_ONLY", "True").lower() == "true"
 
-      - name: Commit updated state
-        if: always()
-        run: |
-          git config user.name "ai-news-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add state.json
-          git diff --quiet --cached || git commit -m "update state [skip ci]"
-          git push
+# در اولین اجرای هر کانال، چند تا از آخرین پست‌ها بک‌فیل بشن.
+# نسخه‌ی وب کانال (t.me/s) خودش حداکثر ~۲۰ پست آخر رو نشون میده، پس عدد ۲۰
+# یعنی «هر چی هست بیار» (سقف واقعی رو خود صفحه‌ی تلگرام تعیین می‌کنه، نه ما).
+BACKFILL_ON_FIRST_RUN = int(os.environ.get("BACKFILL_ON_FIRST_RUN", "20"))
+
+# حداکثر چند پست جدید از هر کانال در هر اجرا پردازش بشه (تا کانال‌های پرکار
+# سهمیه‌ی کانال‌های دیگه رو نخورن). عدد بالا یعنی عملاً محدودیتی نیست.
+MAX_POSTS_PER_CHANNEL = int(os.environ.get("MAX_POSTS_PER_CHANNEL", "20"))
+
+# محدودیت‌های تلگرام برای طول متن
+MAX_CAPTION_LEN = 1024   # کپشن عکس/ویدیو
+MAX_MESSAGE_LEN = 4096   # پیام متنی خالی
+
+# امضای ثابتی که زیر هر پست اضافه میشه (از Secrets قابل تغییره، وگرنه این پیش‌فرضه)
+SIGNATURE = os.environ.get(
+    "SIGNATURE",
+    "AI mind | saharnaz\nInstagram: saharnaz.astronomy\nTelegram & Bale: @saharnazAILearning",
+)
+
+STATE_PATH = "state.json"
+BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("ai_news_bot")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://t.me/",
+}
+
+
+# ---------------------------------------------------------------------------
+# وضعیت (state) بین اجراها
+# ---------------------------------------------------------------------------
+def load_state():
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {}
+    data.setdefault("seen_ids", {})       # channel -> [post_id, ...] که واقعاً پست شدن یا آگاهانه رد شدن
+    data.setdefault("last_ids", {})       # فقط برای مهاجرت از نسخه‌ی قبلی نگه داشته میشه
+    return data
+
+
+def save_state(state):
+    # هر کانال حداکثر ۳۰۰ آیدی آخر رو نگه می‌داره که فایل بی‌نهایت بزرگ نشه
+    for ch, ids in state["seen_ids"].items():
+        state["seen_ids"][ch] = sorted(set(ids), reverse=True)[:300]
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# فیلتر موضوعی
+# ---------------------------------------------------------------------------
+AI_KEYWORDS = [
+    "ai", "a.i.", "artificial intelligence", "machine learning", "llm",
+    "gpt", "chatgpt", "openai", "claude", "anthropic", "gemini", "deepseek",
+    "neural network", "deep learning", "هوش مصنوعی", "یادگیری ماشین",
+    "مدل زبانی", "چت‌جی‌پی‌تی",
+]
+
+
+def is_ai_related(text: str) -> bool:
+    if not FILTER_AI_ONLY:
+        return True
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(kw in lowered for kw in AI_KEYWORDS)
+
+
+def truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def with_signature(text: str, limit: int) -> str:
+    """متن رو کوتاه می‌کنه (در صورت لزوم) تا امضا زیرش جا بشه، بعد امضا رو اضافه می‌کنه."""
+    footer = f"\n\n{SIGNATURE}" if SIGNATURE.strip() else ""
+    body_limit = max(limit - len(footer), 0)
+    body = truncate(text, body_limit) if text.strip() else text
+    combined = f"{body}{footer}" if body.strip() else SIGNATURE
+    return combined[:limit]
+
+
+# ---------------------------------------------------------------------------
+# ترجمه
+# ---------------------------------------------------------------------------
+def translate_to_persian(text: str) -> str:
+    if not text or not text.strip():
+        return ""
+    try:
+        resp = requests.post(
+            f"{TRANSLATE_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {TRANSLATE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": TRANSLATE_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "تو یک مترجم و ویراستار خبری حرفه‌ای هستی که برای یک کانال خبری "
+                            "هوش مصنوعی در تلگرام کار می‌کنی. متن انگلیسی زیر رو به فارسیِ "
+                            "کاملاً روان، طبیعی و روزنامه‌نگارانه بازنویسی کن — نه ترجمه‌ی "
+                            "کلمه‌به‌کلمه. یعنی:\n"
+                            "- ساختار جمله رو کاملاً بر اساس دستور زبان فارسی بازچینی کن، "
+                            "همون ترتیب کلمات جمله‌ی انگلیسی رو حفظ نکن.\n"
+                            "- جمله‌های خیلی بلند رو در صورت نیاز به چند جمله‌ی کوتاه‌تر و "
+                            "روان‌تر فارسی تبدیل کن.\n"
+                            "- اسم شرکت‌ها، محصولات، و اصطلاحات رایج تخصصی (مثل ChatGPT، "
+                            "OpenAI، مدل زبانی، API، LLM) رو به همون شکلی که در فارسی رایج و "
+                            "قابل‌فهمه بنویس؛ لازم نیست همه‌چیز رو فارسی‌سازی کنی.\n"
+                            "- اعداد، تاریخ‌ها و اسم‌های خاص رو دقیق و بدون تغییر منتقل کن.\n"
+                            "- لحن خبری، مستقیم، و بدون اضافه‌گویی یا نظر شخصی باشه.\n"
+                            "- هیچ توضیح، مقدمه، یا علامت نقل‌قول اضافه نکن؛ فقط و فقط متن "
+                            "نهایی فارسی رو برگردون."
+                        ),
+                    },
+                    {"role": "user", "content": text[:3000]},
+                ],
+                "temperature": 0.4,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.error(f"خطا در ترجمه: {e}")
+        return text
+
+
+# ---------------------------------------------------------------------------
+# خوندن پست‌های جدید یک کانال از نسخه‌ی وبِ عمومی‌اش
+# ---------------------------------------------------------------------------
+def fetch_channel_posts(channel: str):
+    url = f"https://t.me/s/{channel}"
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    posts = []
+    for msg_div in soup.select("div.tgme_widget_message"):
+        data_post = msg_div.get("data-post")
+        if not data_post:
+            continue
+        try:
+            msg_id = int(data_post.split("/")[-1])
+        except ValueError:
+            continue
+
+        text_div = msg_div.select_one(".tgme_widget_message_text")
+        text = text_div.get_text("\n").strip() if text_div else ""
+
+        photo_urls = []
+        for photo_wrap in msg_div.select(".tgme_widget_message_photo_wrap"):
+            style = photo_wrap.get("style", "")
+            m = re.search(r"url\('(.+?)'\)", style)
+            if m:
+                photo_urls.append(m.group(1))
+
+        video_url = None
+        video_tag = msg_div.select_one("video.tgme_widget_message_video")
+        if video_tag and video_tag.get("src"):
+            video_url = video_tag["src"]
+
+        posts.append(
+            {"id": msg_id, "text": text, "photo_urls": photo_urls, "video_url": video_url}
+        )
+
+    posts.sort(key=lambda p: p["id"])
+    return posts
+
+
+# ---------------------------------------------------------------------------
+# خوندن پست‌های جدید یک فید RSS (سایت‌های خبری، نه تلگرام)
+# ---------------------------------------------------------------------------
+def fetch_rss_posts(feed_url: str):
+    parsed = feedparser.parse(feed_url)
+    posts = []
+    for entry in parsed.entries[:20]:
+        link = entry.get("link", "")
+        uid_source = entry.get("id") or link or entry.get("title", "")
+        uid = hashlib.sha256(uid_source.encode("utf-8")).hexdigest()[:16]
+
+        title = (entry.get("title") or "").strip()
+        raw_summary = entry.get("summary") or entry.get("description") or ""
+        summary = BeautifulSoup(raw_summary, "html.parser").get_text(" ").strip()
+        text = f"{title}\n\n{summary}" if summary else title
+
+        photo_urls = []
+        for m in entry.get("media_content", []) or []:
+            if m.get("url"):
+                photo_urls.append(m["url"])
+                break
+        if not photo_urls:
+            thumbs = entry.get("media_thumbnail") or []
+            if thumbs and thumbs[0].get("url"):
+                photo_urls.append(thumbs[0]["url"])
+        if not photo_urls:
+            for l in entry.get("links", []) or []:
+                if l.get("rel") == "enclosure" and str(l.get("type", "")).startswith("image"):
+                    photo_urls.append(l["href"])
+                    break
+
+        posts.append(
+            {"id": uid, "text": text, "photo_urls": photo_urls, "video_url": None, "link": link}
+        )
+
+    posts.reverse()  # فیدها معمولاً جدیدترین اول میدن، برعکسش می‌کنیم که قدیمی‌تر اول پست بشه
+    return posts
+
+
+# ---------------------------------------------------------------------------
+# دانلود مدیا (چون تلگرام خودش نمی‌تونه لینک‌های محافظت‌شده رو fetch کنه)
+# ---------------------------------------------------------------------------
+def download_media(url: str, max_bytes: int = 20 * 1024 * 1024):
+    r = requests.get(url, headers=HEADERS, timeout=20, stream=True)
+    r.raise_for_status()
+    content = r.content
+    if len(content) > max_bytes:
+        raise ValueError("فایل خیلی بزرگه")
+    return content
+
+
+# ---------------------------------------------------------------------------
+# پست کردن در کانال مقصد با Bot API (آپلود مستقیم فایل، نه لینک)
+# ---------------------------------------------------------------------------
+def send_to_channel(post: dict, caption: str):
+    photo_urls = post["photo_urls"]
+    video_url = post["video_url"]
+
+    try:
+        if len(photo_urls) > 1:
+            media = []
+            files = {}
+            for i, u in enumerate(photo_urls[:10]):  # سقف تلگرام برای آلبوم: ۱۰ تا
+                content = download_media(u)
+                field = f"photo{i}"
+                files[field] = (f"{field}.jpg", content, "image/jpeg")
+                item = {"type": "photo", "media": f"attach://{field}"}
+                if i == 0:
+                    item["caption"] = with_signature(caption, MAX_CAPTION_LEN)
+                media.append(item)
+            data = {"chat_id": TARGET_CHANNEL, "media": json.dumps(media)}
+            r = requests.post(f"{BOT_API}/sendMediaGroup", data=data, files=files, timeout=60)
+
+        elif len(photo_urls) == 1:
+            content = download_media(photo_urls[0])
+            files = {"photo": ("photo.jpg", content, "image/jpeg")}
+            data = {"chat_id": TARGET_CHANNEL, "caption": with_signature(caption, MAX_CAPTION_LEN)}
+            r = requests.post(f"{BOT_API}/sendPhoto", data=data, files=files, timeout=60)
+
+        elif video_url:
+            content = download_media(video_url)
+            files = {"video": ("video.mp4", content, "video/mp4")}
+            data = {"chat_id": TARGET_CHANNEL, "caption": with_signature(caption, MAX_CAPTION_LEN)}
+            r = requests.post(f"{BOT_API}/sendVideo", data=data, files=files, timeout=60)
+
+        elif caption.strip():
+            r = requests.post(
+                f"{BOT_API}/sendMessage",
+                json={"chat_id": TARGET_CHANNEL, "text": with_signature(caption, MAX_MESSAGE_LEN)},
+                timeout=30,
+            )
+        else:
+            return True  # چیزی برای پست کردن نبود
+
+        ok = r.json().get("ok", False)
+        if not ok:
+            log.error(f"تلگرام خطا داد: {r.text}")
+        return ok
+
+    except Exception as e:
+        log.error(f"خطا در ارسال به کانال، تلاش با متن‌تنها: {e}")
+        if caption.strip():
+            try:
+                r = requests.post(
+                    f"{BOT_API}/sendMessage",
+                    json={
+                        "chat_id": TARGET_CHANNEL,
+                        "text": with_signature(caption, MAX_MESSAGE_LEN),
+                    },
+                    timeout=30,
+                )
+                return r.json().get("ok", False)
+            except Exception as e2:
+                log.error(f"خطا در ارسال متن جایگزین: {e2}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# پردازش مشترک یک منبع (چه کانال تلگرام، چه فید RSS)
+# ---------------------------------------------------------------------------
+def process_source(source_key: str, posts: list, state: dict):
+    seen_ids = set(state["seen_ids"].get(source_key, []))
+    is_brand_new = source_key not in state["seen_ids"] and source_key not in state["last_ids"]
+
+    # مهاجرت از نسخه‌ی قبلی (فقط برای کانال‌های تلگرام معنی داره، چون RSS از
+    # اول با همین سیستم seen_ids کار کرده)
+    old_last_id = state["last_ids"].get(source_key)
+    if old_last_id is not None:
+        seen_ids |= {p["id"] for p in posts if isinstance(p["id"], int) and p["id"] <= old_last_id}
+
+    candidates = [p for p in posts if p["id"] not in seen_ids]
+    if is_brand_new:
+        candidates = candidates[-BACKFILL_ON_FIRST_RUN:] if BACKFILL_ON_FIRST_RUN > 0 else []
+
+    to_process = candidates[:MAX_POSTS_PER_CHANNEL]
+    remaining = len(candidates) - len(to_process)
+
+    posted_count = 0
+    failed_count = 0
+    checked_count = 0
+
+    for post in to_process:
+        checked_count += 1
+
+        if not is_ai_related(post["text"]):
+            seen_ids.add(post["id"])
+            continue
+
+        translated = translate_to_persian(post["text"])
+        if post.get("link"):
+            translated = f"{translated}\n\n🔗 {post['link']}"
+
+        ok = send_to_channel(post, translated)
+        if ok:
+            posted_count += 1
+            seen_ids.add(post["id"])
+            log.info(f"پست شد: {source_key}/{post['id']}")
+        else:
+            failed_count += 1
+            log.warning(f"پست نشد، دور بعد دوباره تلاش میشه: {source_key}/{post['id']}")
+        time.sleep(0.5)
+
+    state["seen_ids"][source_key] = list(seen_ids)
+
+    note = f"{source_key}: {posted_count} پست منتشر شد"
+    if failed_count:
+        note += f"، {failed_count} تا شکست خورد (دوباره تلاش میشه)"
+    if remaining > 0:
+        note += f" ({remaining} پست دیگه برای اجرای بعدی مونده)"
+    return note, checked_count
+
+
+# ---------------------------------------------------------------------------
+# اجرای اصلی
+# ---------------------------------------------------------------------------
+def main():
+    state = load_state()
+    total_processed = 0
+    summary = []
+
+    for channel in SOURCE_CHANNELS:
+        try:
+            posts = fetch_channel_posts(channel)
+        except Exception as e:
+            log.error(f"خطا در خوندن کانال {channel}: {e}")
+            summary.append(f"{channel}: خطا در خوندن ({e})")
+            continue
+        note, checked = process_source(channel, posts, state)
+        summary.append(note)
+        total_processed += checked
+
+    for feed_url in RSS_FEEDS:
+        try:
+            posts = fetch_rss_posts(feed_url)
+        except Exception as e:
+            log.error(f"خطا در خوندن فید {feed_url}: {e}")
+            summary.append(f"{feed_url}: خطا در خوندن ({e})")
+            continue
+        note, checked = process_source(feed_url, posts, state)
+        summary.append(note)
+        total_processed += checked
+
+    # last_ids دیگه استفاده نمیشه، فقط برای سازگاری با نسخه‌ی قبلی نگه داشته شد؛
+    # از این به بعد پاکش می‌کنیم که فایل state تمیز بمونه
+    state["last_ids"] = {}
+
+    save_state(state)
+    log.info("خلاصه‌ی این اجرا:")
+    for line in summary:
+        log.info(f"  - {line}")
+    log.info(f"اجرای این دور تمام شد. (مجموعاً {total_processed} پست بررسی شد)")
+
+
+if __name__ == "__main__":
+    main()
